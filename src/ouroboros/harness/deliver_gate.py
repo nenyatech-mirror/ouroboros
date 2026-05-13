@@ -257,28 +257,39 @@ def evaluate_deliver_claim(
         raise ValueError(msg)
 
     traceguard_manifest, source_events_by_handle = _traceguard_manifest(manifest, claim)
+    missing_evidence = _missing_evidence_summaries(
+        claim,
+        available_handles=frozenset(source_events_by_handle),
+    )
     parent_synthesis = _parent_synthesis_from_claim(claim)
     raw_result = traceguard_validator(
         evidence_manifest=traceguard_manifest,
         parent_synthesis=parent_synthesis,
     )
-    rejected = _rejected_claim_summaries(raw_result)
+    rejected = missing_evidence + _rejected_claim_summaries(raw_result)
     accepted_claims = getattr(raw_result, "accepted_claims", ())
     accepted_fact_ids = _claim_fact_ids(accepted_claims)
     if not accepted_fact_ids:
         accepted_fact_ids = _string_tuple(getattr(raw_result, "allowed_fact_ids", ()))
-    rejected_fact_ids = tuple(fact_id for fact_id, _, _ in rejected if fact_id is not None)
+    rejected_fact_ids = _dedupe_strings(
+        fact_id for fact_id, _, _ in rejected if fact_id is not None
+    )
     accepted_handles = _claim_chunk_ids(accepted_claims)
     if not accepted_handles:
         accepted_handles = _string_tuple(getattr(raw_result, "allowed_chunk_ids", ()))
+    unsupported_claim_rate = _unsupported_claim_rate(
+        raw_rate=float(raw_result.unsupported_claim_rate),
+        rejected=rejected,
+        total_claims=len(claim.facts),
+    )
 
     return DeliverGateVerdict(
         ac_id=manifest.ac_id,
-        accepted=bool(raw_result.accepted),
-        unsupported_claim_rate=float(raw_result.unsupported_claim_rate),
+        accepted=bool(raw_result.accepted) and not missing_evidence,
+        unsupported_claim_rate=unsupported_claim_rate,
         accepted_fact_ids=accepted_fact_ids,
         rejected_fact_ids=rejected_fact_ids,
-        rejected_reasons=tuple(reason for _, _, reason in rejected),
+        rejected_reasons=_dedupe_strings(reason for _, _, reason in rejected),
         evidence_event_ids=_evidence_event_ids_for_handles(
             accepted_handles,
             source_events_by_handle=source_events_by_handle,
@@ -429,6 +440,46 @@ def _rejected_claim_summaries(
     return tuple(summaries)
 
 
+def _missing_evidence_summaries(
+    claim: DeliverEvidenceClaim,
+    *,
+    available_handles: frozenset[str],
+) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        (
+            fact.fact_id,
+            fact.evidence_handle,
+            f"missing_evidence_handle: {fact.evidence_handle} is not present in manifest",
+        )
+        for fact in claim.facts
+        if fact.evidence_handle not in available_handles
+    )
+
+
+def _unsupported_claim_rate(
+    *,
+    raw_rate: float,
+    rejected: tuple[tuple[str | None, str | None, str], ...],
+    total_claims: int,
+) -> float:
+    if total_claims <= 0:
+        return raw_rate
+    rejected_keys = {_rejection_key(item) for item in rejected}
+    rejected_count = len(rejected_keys)
+    if rejected_count:
+        return round(min(1.0, rejected_count / total_claims), 4)
+    return raw_rate
+
+
+def _rejection_key(item: tuple[str | None, str | None, str]) -> tuple[str, str]:
+    fact_id, chunk_id, reason = item
+    if fact_id is not None:
+        return ("fact", fact_id)
+    if chunk_id is not None:
+        return ("chunk", chunk_id)
+    return ("reason", reason)
+
+
 def _evidence_event_ids_for_handles(
     handles: tuple[str, ...],
     *,
@@ -460,6 +511,16 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     return tuple(
         item.strip() for item in _iter_result_items(value) if isinstance(item, str) and item.strip()
     )
+
+
+def _dedupe_strings(values: Iterable[str]) -> tuple[str, ...]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value not in seen:
+            ordered.append(value)
+            seen.add(value)
+    return tuple(ordered)
 
 
 def _claim_attr(claim: object, name: str) -> str | None:
