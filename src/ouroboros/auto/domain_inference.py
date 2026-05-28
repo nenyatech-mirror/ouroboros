@@ -26,9 +26,123 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+import re
 
 from ouroboros.auto.ledger import LedgerSection, LedgerStatus, SeedDraftLedger
 from ouroboros.auto.task_classes import TaskClass
+
+# Word-boundary token regex for the single-word "cli" goal signal. Avoids
+# false-positive substring matches against words that happen to contain
+# the letters "cli" (e.g. "client", "click", "clinic", "command-clinic")
+# now that `goal_signal` is independently sufficient (see review on PR
+# #1264 / #1170 R2 follow-up).
+_CLI_GOAL_TOKEN_RE = re.compile(r"\bcli\b")
+
+# Multi-word "command line" / "command-line" phrase regex. Not vulnerable
+# to the substring-false-friend class, but folded into the same negation
+# pipeline below so "not a command-line tool" is rejected consistently
+# with "not a CLI".
+_CLI_GOAL_PHRASE_RE = re.compile(r"\bcommand[\s\-]line\b")
+
+# Explicit-negation pattern matching common natural-language denials of
+# the CLI signal. The earlier whitelist-of-connectors strategy
+# (rounds 2-6) proved too narrow — every review round surfaced another
+# descriptive participle that was missing from the list ("intended",
+# "meant", "designed", "exposed", "for", …). Switching to a generic
+# distance-bounded path with an *affirmative-qualifier blocklist* is
+# both more robust and easier to reason about:
+#
+#   <negation cue>   <path of up to 7 tokens>   <cli|command-line>
+#
+# The strip is *suppressed* if the path contains an affirmative-flip
+# qualifier — "just", "only", "also", "rather", "but" — because those
+# tokens turn the phrase into an affirmative expansion ("not just a
+# CLI", "not only a CLI", "not a webhook but rather a CLI") that
+# genuinely asserts CLI. Those cases must keep their CLI signal.
+#
+# Covers the shapes flagged across rounds 2-7:
+#   - Direct:           "not a CLI", "no CLI", "never a CLI",
+#                       "isn't a CLI".
+#   - Modal/copular:    "should not be a CLI", "cannot be a CLI",
+#                       "shouldn't be a CLI", "doesn't have to be a CLI".
+#   - Exclusion:        "without a CLI", "excluding a CLI", "sans CLI",
+#                       "instead of a CLI", "rather than a CLI".
+#   - Participle:       "not intended to be a CLI", "not meant to be
+#                       a CLI", "not designed to be a CLI",
+#                       "not exposed as a CLI", "not for CLI use".
+#
+# Each variant also works for the multi-word "command line" /
+# "command-line" phrase. See PR #1264 review rounds 2-7.
+_NEGATION_CUE_FRAGMENT = (
+    r"(?:not|no|never|"
+    r"without|excluding|sans|"
+    r"isn[’']?t|aren[’']?t|wasn[’']?t|weren[’']?t|"
+    r"won[’']?t|wouldn[’']?t|shouldn[’']?t|"
+    r"can[’']?t|cannot|"
+    r"doesn[’']?t|don[’']?t|didn[’']?t|"
+    r"instead\s+of|rather\s+than)"
+)
+_NEGATED_CLI_GOAL_RE = re.compile(
+    rf"\b(?P<cue>{_NEGATION_CUE_FRAGMENT})"
+    r"(?P<path>(?:\s+\S+){0,7}?)"  # Up to 7 intervening tokens (non-greedy).
+    r"\s+(?:cli|command[\s\-]line)\b"
+)
+
+# Words that, when they appear in the intervening path between a
+# negation cue and the CLI signal, flip the phrase into an affirmative
+# expansion. "not just a CLI" / "not only a CLI" mean "a CLI AND
+# something else"; "but rather a CLI" / "not X but a CLI" mean "the
+# tool IS a CLI". When any of these appears in a candidate strip span,
+# the strip is suppressed so the positive CLI signal survives.
+_AFFIRMATIVE_FLIP_RE = re.compile(r"\b(?:just|only|also|rather|but)\b")
+
+# Prefix-style negation ("non-CLI" / "non CLI" / "non-command-line").
+# `\b` boundaries prevent false matches on unrelated words containing
+# the letters (e.g. "non-client" or "non-clinic" — the `cli\b` boundary
+# fails because the following letters extend the word). Tracked
+# separately from `_NEGATED_CLI_GOAL_RE` because the cue ("non") is
+# directly fused to the CLI token rather than separated by connectors.
+# See PR #1264 review round 6.
+_NEGATED_CLI_PREFIX_RE = re.compile(r"\bnon[\s\-]?(?:cli|command[\s\-]line)\b")
+
+
+def _goal_has_unnegated_cli_signal(goal_text: str) -> bool:
+    """Return True iff *goal_text* contains a CLI signal that is not
+    inside a recognized negation clause.
+
+    Strategy: detect any positive CLI signal (token or multi-word
+    phrase), then strip recognized negation wrappers from the text and
+    re-check. If a positive signal survives the strip, the goal
+    genuinely asserts CLI.
+    """
+    has_signal = bool(_CLI_GOAL_TOKEN_RE.search(goal_text)) or bool(
+        _CLI_GOAL_PHRASE_RE.search(goal_text)
+    )
+    if not has_signal:
+        return False
+
+    def _strip_if_not_affirmative(match: re.Match[str]) -> str:
+        """Drop the matched negation span unless its **path** (the text
+        between the negation cue and the CLI token) contains an
+        affirmative-flip qualifier (just/only/also/rather/but), in
+        which case the phrase is actually an affirmative expansion and
+        the CLI signal must survive.
+
+        The cue itself ("rather than", "instead of", …) is excluded
+        from the affirmative check on purpose — otherwise the
+        "rather" inside the cue "rather than" would mis-block the
+        strip for legitimate negation phrases like "rather than a
+        CLI".
+        """
+        path = match.group("path") or ""
+        if _AFFIRMATIVE_FLIP_RE.search(path):
+            return match.group(0)
+        return " "
+
+    stripped = _NEGATED_CLI_GOAL_RE.sub(_strip_if_not_affirmative, goal_text)
+    stripped = _NEGATED_CLI_PREFIX_RE.sub(" ", stripped)
+    return bool(_CLI_GOAL_TOKEN_RE.search(stripped)) or bool(_CLI_GOAL_PHRASE_RE.search(stripped))
+
 
 __all__ = [
     "DomainInference",
@@ -130,15 +244,31 @@ def _matches_cli(ledger: SeedDraftLedger) -> bool:
     outputs = _section_text(ledger, "outputs")
     runtime = _section_text(ledger, "runtime_context")
     if not (outputs or runtime):
+        # Gate: require *some* ledger-side evidence beyond the goal text
+        # so single-word "cli" mentions in goal cannot classify alone.
         return False
     output_signal = _any_of(
         outputs,
         ("stdout", "exit code", "printed", "console output", "command output"),
     )
     runtime_signal = _any_of(runtime, ("shell", "terminal", "subprocess", "command line"))
-    goal_signal = _any_of(_goal_text(ledger), ("cli", "command line", "command-line"))
-    # CLI requires either explicit runtime *or* a goal+output combo.
-    return runtime_signal or (output_signal and (goal_signal or outputs))
+    # Goal-side CLI signal: token-bounded "cli" OR explicit "command line"
+    # / "command-line" multi-word phrase, with explicit-negation
+    # stripping. Substring-only matching against "cli" would false-
+    # positive on "client", "click", "clinic", etc. (first-round PR
+    # #1264 blocker), and naked token matching still classifies "not a
+    # CLI" / "no CLI" goals as CLI (second-round PR #1264 blocker), so
+    # both classes route through `_goal_has_unnegated_cli_signal`.
+    goal_text = _goal_text(ledger)
+    goal_signal = _goal_has_unnegated_cli_signal(goal_text)
+    # Each of the three signals is independently sufficient once the
+    # ledger-evidence gate above is satisfied. The earlier form
+    # `runtime_signal or (output_signal and (goal_signal or outputs))`
+    # made `goal_signal` dead code (outputs is already non-empty past
+    # the gate), which blocked cli-todo on ledger_only closures whose
+    # conservative-default outputs lack stdout/exit-code vocabulary.
+    # See #1170 R2 evidence and #1157 closure policy.
+    return runtime_signal or goal_signal or output_signal
 
 
 def _matches_webhook(ledger: SeedDraftLedger) -> bool:
@@ -231,12 +361,16 @@ def _matches_library(ledger: SeedDraftLedger) -> bool:
     goal = _goal_text(ledger)
     if not (outputs or goal):
         return False
+    # "module" intentionally omitted — it is a generic Python term used
+    # for any code unit (including CLI entry points) and produced too
+    # many false positives that shadowed cli / web_service inference
+    # under ledger_only closures. The remaining keywords are
+    # library-distinctive surface terms. See #1170 R2 evidence.
     return _any_of(
         outputs + " " + goal,
         (
             "library",
             "package",
-            "module",
             "api surface",
             "importable",
             "public api",
