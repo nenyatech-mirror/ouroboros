@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from ouroboros.auto.answerer import AutoAnswer, AutoAnswerSource
+from ouroboros.auto.answerer import AutoAnswer, AutoAnswerer, AutoAnswerSource
 from ouroboros.auto.interview_driver import (
     AutoInterviewDriver,
     FunctionInterviewBackend,
@@ -93,13 +93,18 @@ async def test_assumption_source_is_also_refined(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_multi_section_answer_is_not_refined(tmp_path) -> None:
-    """A multi-ledger-update answer is left untouched to preserve transcript/ledger
-    sync — a single refined string cannot coherently replace distinct per-section
-    values (e.g. the verification route updates verification_plan + acceptance_criteria)."""
+async def test_multi_section_answer_is_refined_per_section(tmp_path) -> None:
+    """A multi-ledger-update answer is refined PER SECTION. The refiner is
+    section-aware, so each entry gets its own concrete value and the transcript
+    stays in sync with the ledger. This is the common case (every real
+    ``AutoAnswerer`` route emits >=2 updates); skipping it left the refiner inert
+    and interview ambiguity unconverged."""
 
-    async def refiner(*_a) -> str:
-        raise AssertionError("must not refine a multi-section answer (would desync)")
+    calls: list[str] = []
+
+    async def refiner(goal: str, question: str, section: str, generic: str) -> str:  # noqa: ARG001
+        calls.append(section)
+        return f"concrete::{section}"
 
     def _entry(section: str, value: str) -> LedgerEntry:
         return LedgerEntry(
@@ -124,10 +129,104 @@ async def test_multi_section_answer_is_not_refined(tmp_path) -> None:
     state = AutoPipelineState(goal="g", cwd=str(tmp_path))
     out = await driver._refine_answer(multi, "q", state, SeedDraftLedger.from_goal("g"))
 
-    # Untouched: text + both ledger entries keep their original (in-sync) values.
-    assert out.text == "generic verification text"
-    assert out.ledger_updates[0][1].value == "run tests"
-    assert out.ledger_updates[1][1].value == "command prints output"
+    # Each section refined with its own concrete value; transcript rebuilt from them.
+    assert calls == ["verification_plan", "acceptance_criteria"]
+    assert out.ledger_updates[0][1].value == "concrete::verification_plan"
+    assert out.ledger_updates[1][1].value == "concrete::acceptance_criteria"
+    assert out.text == "concrete::verification_plan concrete::acceptance_criteria"
+
+
+@pytest.mark.asyncio
+async def test_partial_section_refine_keeps_transcript_and_ledger_in_sync(tmp_path) -> None:
+    """If one section's refiner call fails/blanks, that entry keeps its original
+    value AND that original value stays in the rebuilt transcript. The text the
+    backend acknowledges must describe the same committed content as every
+    persisted ledger entry — a refined section must never leave its peer absent
+    from the transcript (the desync invariant the refiner must preserve)."""
+
+    async def refiner(goal: str, question: str, section: str, generic: str) -> str | None:  # noqa: ARG001
+        return "concrete::constraints" if section == "constraints" else None
+
+    def _entry(section: str, value: str) -> LedgerEntry:
+        return LedgerEntry(
+            key=f"{section}.x",
+            value=value,
+            source=LedgerSource.CONSERVATIVE_DEFAULT,
+            confidence=0.8,
+            status=LedgerStatus.DEFAULTED,
+        )
+
+    multi = AutoAnswer(
+        text="generic",
+        source=AutoAnswerSource.CONSERVATIVE_DEFAULT,
+        confidence=0.8,
+        ledger_updates=[
+            ("constraints", _entry("constraints", "orig constraints")),
+            ("acceptance_criteria", _entry("acceptance_criteria", "orig acceptance")),
+        ],
+    )
+
+    driver = _driver(tmp_path, refiner)
+    state = AutoPipelineState(goal="g", cwd=str(tmp_path))
+    out = await driver._refine_answer(multi, "q", state, SeedDraftLedger.from_goal("g"))
+
+    # Ledger: refined where it succeeded, original where it failed.
+    assert out.ledger_updates[0][1].value == "concrete::constraints"
+    assert out.ledger_updates[1][1].value == "orig acceptance"
+    # Transcript represents BOTH ledger entries — no desync.
+    assert out.text == "concrete::constraints orig acceptance"
+    assert "orig acceptance" in out.prefixed_text
+
+
+@pytest.mark.asyncio
+async def test_refined_transcript_covers_every_applied_ledger_entry(tmp_path) -> None:
+    """Boundary invariant across the refine -> apply seam: the text the backend
+    acknowledges — ``prefixed_text``, which the driver passes verbatim to
+    ``backend.answer`` and which ``apply`` records into the ledger transcript —
+    must contain every ledger entry value that ``apply`` persists, including a
+    fallback (unrefined) section. This observes the transcript/backend boundary
+    where a partial-refinement desync would actually surface, not just the
+    helper's return shape."""
+
+    async def refiner(goal: str, question: str, section: str, generic: str) -> str | None:  # noqa: ARG001
+        # Partial: refine constraints, fail acceptance_criteria.
+        if section == "constraints":
+            return "Store todos in ~/.todo-cli.json; ids are 1-based list positions."
+        return None
+
+    def _entry(section: str, value: str) -> LedgerEntry:
+        return LedgerEntry(
+            key=f"{section}.x",
+            value=value,
+            source=LedgerSource.CONSERVATIVE_DEFAULT,
+            confidence=0.8,
+            status=LedgerStatus.DEFAULTED,
+        )
+
+    answer = AutoAnswer(
+        text="generic product behavior",
+        source=AutoAnswerSource.CONSERVATIVE_DEFAULT,
+        confidence=0.8,
+        ledger_updates=[
+            ("constraints", _entry("constraints", "Preserve the requested product behavior.")),
+            (
+                "acceptance_criteria",
+                _entry("acceptance_criteria", "A command check exits 0 with evidence."),
+            ),
+        ],
+    )
+
+    driver = _driver(tmp_path, refiner)
+    state = AutoPipelineState(goal="build a todo CLI", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    refined = await driver._refine_answer(answer, "Where should todos be stored?", state, ledger)
+
+    # Apply persists ledger_updates and records prefixed_text into the transcript.
+    AutoAnswerer().apply(refined, ledger, question="Where should todos be stored?")
+
+    backend_text = refined.prefixed_text  # exactly what backend.answer(session_id, ...) receives
+    for section, entry in refined.ledger_updates:
+        assert entry.value in backend_text, f"{section} value absent from acknowledged transcript"
 
 
 @pytest.mark.asyncio
