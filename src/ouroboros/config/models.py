@@ -373,6 +373,8 @@ VALID_RUNTIME_BACKENDS = frozenset(
         "pi_cli",
         "gjc",
         "gjc_cli",
+        "antigravity",
+        "agy",
     }
 )
 
@@ -487,6 +489,11 @@ class OrchestratorConfig(BaseModel, frozen=True):
             - Absolute path: /path/to/gemini
             - ~ expansion: ~/.local/bin/gemini
             - None: Resolve from PATH at runtime (or OUROBOROS_GEMINI_CLI_PATH)
+        antigravity_cli_path: Path to the Antigravity CLI binary (``agy``).
+            Supports:
+            - Absolute path: /path/to/agy
+            - ~ expansion: ~/.local/bin/agy
+            - None: Resolve from PATH at runtime (or OUROBOROS_ANTIGRAVITY_CLI_PATH)
         default_max_turns: Default max turns for agent execution
         max_parallel_workers: Default maximum concurrent AC workers
         usage_limit_pause_hours: Default pause window for provider usage/quota limits
@@ -497,7 +504,17 @@ class OrchestratorConfig(BaseModel, frozen=True):
     """
 
     runtime_backend: Literal[
-        "claude", "codex", "opencode", "hermes", "gemini", "kiro", "copilot", "goose", "pi", "gjc"
+        "claude",
+        "codex",
+        "opencode",
+        "hermes",
+        "gemini",
+        "kiro",
+        "copilot",
+        "goose",
+        "pi",
+        "gjc",
+        "antigravity",
     ] = "claude"
     runtime_profile: RuntimeProfileConfig | None = None
 
@@ -536,6 +553,7 @@ class OrchestratorConfig(BaseModel, frozen=True):
     goose_cli_path: str | None = None
     pi_cli_path: str | None = None
     gjc_cli_path: str | None = None
+    antigravity_cli_path: str | None = None
     ourocode_cli_path: str | None = None
     default_max_turns: int = Field(default=10, ge=1)
     max_parallel_workers: int = Field(default=3, ge=1)
@@ -556,6 +574,7 @@ class OrchestratorConfig(BaseModel, frozen=True):
         "goose_cli_path",
         "pi_cli_path",
         "gjc_cli_path",
+        "antigravity_cli_path",
         "ourocode_cli_path",
     )
     @classmethod
