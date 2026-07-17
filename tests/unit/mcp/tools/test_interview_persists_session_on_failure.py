@@ -192,6 +192,50 @@ async def test_tool_envelope_question_failure_hands_off_to_parent_session(
 
 
 @pytest.mark.asyncio
+async def test_claude_success_error_text_is_not_treated_as_envelope_violation(
+    tmp_path: Path,
+) -> None:
+    """An SDK diagnostic string alone must not masquerade as an envelope violation."""
+    provider_error = ProviderError(
+        "Claude Agent SDK request failed: Claude Code returned an error result: success",
+        details={"error_type": "Exception", "session_id": "claude-session-1"},
+    )
+    engine = _FakeInterviewEngine(state_dir=tmp_path, question_error=provider_error)
+    mock_store = AsyncMock()
+    handler = InterviewHandler(
+        interview_engine=engine,
+        event_store=mock_store,
+        agent_runtime_backend=None,
+        opencode_mode=None,
+        data_dir=tmp_path,
+    )
+
+    outcome = await handler.handle({"initial_context": "Build a CLI", "cwd": str(tmp_path)})
+    await handler.close()
+
+    assert outcome.is_ok
+    mcp_result = outcome.value
+    assert mcp_result.is_error is True
+    meta = mcp_result.meta or {}
+    assert meta["recoverable"] is True
+    assert meta.get("status") != "parent_question_required"
+    assert "ask_user_directly" not in meta
+    assert "reason_code" not in meta
+    assert "Question generation failed" in mcp_result.content[0].text
+
+    session_id = meta["session_id"]
+    persisted_state = engine.states[session_id]
+    assert persisted_state.rounds == []
+    assert persisted_state.status == InterviewStatus.IN_PROGRESS
+    assert (tmp_path / f"interview_{session_id}.json").exists()
+    assert engine.saved_states
+
+    event_types = [call.args[0].type for call in mock_store.append.await_args_list]
+    assert "interview.question_generation.parent_handoff" not in event_types
+    assert "interview.failed" in event_types
+
+
+@pytest.mark.asyncio
 async def test_first_question_parent_handoff_resume_records_last_question(
     tmp_path: Path,
 ) -> None:
