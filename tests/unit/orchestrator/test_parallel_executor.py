@@ -945,6 +945,51 @@ def _make_replaying_event_store() -> tuple[AsyncMock, list[BaseEvent]]:
     return event_store, appended_events
 
 
+@pytest.mark.asyncio
+async def test_dispatch_append_failure_does_not_cache_phantom_predecessor() -> None:
+    """A failed dispatch append must leave the next attempt with no fake predecessor."""
+    event_store, appended_events = _make_replaying_event_store()
+    fail_dispatch_append = True
+
+    async def _append(event: BaseEvent) -> None:
+        nonlocal fail_dispatch_append
+        if event.type == "execution.ac.attempt.dispatched" and fail_dispatch_append:
+            fail_dispatch_append = False
+            raise RuntimeError("dispatch append failed")
+        appended_events.append(event)
+
+    event_store.append = AsyncMock(side_effect=_append)
+    executor = ParallelACExecutor(
+        adapter=_FinalMessageRuntime("done", native_session_id="session-1"),
+        event_store=event_store,
+        console=MagicMock(),
+        enable_decomposition=False,
+    )
+    kwargs = {
+        "ac_index": 0,
+        "ac_content": "Implement AC 1",
+        "session_id": "orch_123",
+        "tools": ["Read"],
+        "system_prompt": "system",
+        "seed_goal": "Ship the feature",
+        "depth": 0,
+        "start_time": datetime.now(UTC),
+    }
+
+    with pytest.raises(RuntimeError, match="dispatch append failed"):
+        await executor._execute_atomic_ac(**kwargs)
+    assert executor._ac_runtime_handles == {}
+
+    result = await executor._execute_atomic_ac(**kwargs)
+
+    assert result.success is True
+    dispatch_events = [
+        event for event in appended_events if event.type == "execution.ac.attempt.dispatched"
+    ]
+    assert len(dispatch_events) == 1
+    assert dispatch_events[0].data["previous_ac_dispatch_id"] is None
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     (
@@ -9635,9 +9680,12 @@ class TestParallelACExecutor:
 
         resume_handle = runtime.calls[0]["resume_handle"]
         assert isinstance(resume_handle, RuntimeHandle)
-        assert resume_handle.native_session_id == "opencode-session-9"
+        # Foundation C rejects historical persisted handles without a durable
+        # capsule/dispatch authority; the fresh attempt must not inherit the
+        # provider session across an executor boundary.
+        assert resume_handle.native_session_id is None
         assert resume_handle.approval_mode == "bypassPermissions"
-        assert resume_handle.metadata["server_session_id"] == "server-99"
+        assert "server_session_id" not in resume_handle.metadata
         event_store.replay.assert_awaited_once_with("execution", "orch_123_ac_2")
         assert result.runtime_handle is not None
         assert result.runtime_handle.native_session_id == resume_handle.native_session_id
@@ -9900,8 +9948,8 @@ class TestParallelACExecutor:
 
         resume_handle = runtime.calls[0]["resume_handle"]
         assert isinstance(resume_handle, RuntimeHandle)
-        assert resume_handle.native_session_id == "opencode-session-resumed"
-        assert resume_handle.metadata["server_session_id"] == "server-resumed"
+        assert resume_handle.native_session_id is None
+        assert "server_session_id" not in resume_handle.metadata
         event_store.replay.assert_awaited_once_with("execution", "orch_123_ac_2")
         assert result.runtime_handle is not None
         assert result.runtime_handle.native_session_id == resume_handle.native_session_id
@@ -11507,9 +11555,10 @@ class TestParallelACExecutor:
 
         resume_handle = runtime.calls[0]["resume_handle"]
         assert isinstance(resume_handle, RuntimeHandle)
-        # Should have resumed from the valid (first) event, not the invalid (second) one
-        assert resume_handle.native_session_id == "opencode-session-valid"
-        assert resume_handle.metadata["server_session_id"] == "server-valid"
+        # Historical events without capsule authority are not eligible for
+        # cross-process continuation, even when one contains a valid handle.
+        assert resume_handle.native_session_id is None
+        assert "server_session_id" not in resume_handle.metadata
         assert result.runtime_handle is not None
         assert result.runtime_handle.native_session_id == resume_handle.native_session_id
         assert result.runtime_handle.metadata == resume_handle.metadata

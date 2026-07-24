@@ -41,6 +41,7 @@ from pathlib import Path
 import re
 import time
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
+from uuid import uuid4
 from weakref import ref
 
 import anyio
@@ -79,6 +80,11 @@ from ouroboros.harness.deliver_gate import (
 from ouroboros.harness.journal import EvidenceEntry, EvidenceManifest
 from ouroboros.harness.traceguard_validator import validate_evidence_claims
 from ouroboros.observability.logging import get_logger
+from ouroboros.orchestrator.ac_execution_capsule import (
+    bind_capsule_to_runtime_handle,
+    build_ac_dispatch_authority_scope,
+    compile_ac_execution_capsule,
+)
 from ouroboros.orchestrator.ac_runtime_handle_manager import ACRuntimeHandleManager
 from ouroboros.orchestrator.adapter import (
     AgentMessage,
@@ -275,10 +281,12 @@ from ouroboros.orchestrator.leaf_dispatcher import (
 )
 from ouroboros.orchestrator.level_context import (
     LevelContext,
+    build_context_prompt,
     deserialize_level_contexts,
     extract_level_context,
     serialize_level_contexts,
 )
+from ouroboros.orchestrator.mcp_tools import serialize_tool_catalog
 from ouroboros.orchestrator.model_routing import (
     decide_model,
     resolve_execute_model,
@@ -1672,10 +1680,12 @@ class ParallelACExecutor:
         self._authority_coordinator = self._coordinator
         self._authority_coordinator_review = self._coordinator.run_review
         self._semaphore = anyio.Semaphore(max_concurrent)
+        self._process_local_resume_nonce = uuid4().hex
         self._ac_runtime_handle_manager = ACRuntimeHandleManager(
             adapter,
             event_store,
             task_cwd=task_cwd,
+            process_local_resume_nonce=self._process_local_resume_nonce,
         )
         self._ac_runtime_handles = self._ac_runtime_handle_manager.runtime_handles
         self._event_emitter = ExecutionEventEmitter(
@@ -2130,6 +2140,8 @@ class ParallelACExecutor:
         sub_ac_index: int | None = None,
         node_identity: ExecutionNodeIdentity | None = None,
         retry_attempt: int = 0,
+        expected_capsule_fingerprint: str | None = None,
+        expected_process_local_resume_nonce: str | None = None,
     ) -> RuntimeHandle | None:
         return await self._ac_runtime_handle_manager._load_persisted_ac_runtime_handle(
             ac_index,
@@ -2139,6 +2151,8 @@ class ParallelACExecutor:
             sub_ac_index=sub_ac_index,
             node_identity=node_identity,
             retry_attempt=retry_attempt,
+            expected_capsule_fingerprint=expected_capsule_fingerprint,
+            expected_process_local_resume_nonce=expected_process_local_resume_nonce,
         )
 
     def _remember_ac_runtime_handle(
@@ -5862,6 +5876,84 @@ Respond with either ATOMIC or the structured JSON object only.
         """
         ac_session_id: str | None = None
         semantic_ac_key = semantic_ac_key or derive_semantic_ac_key(ac_spec or ac_content)
+        execution_context_id = execution_id or session_id
+        runtime_identity = build_ac_runtime_identity(
+            ac_index,
+            execution_context_id=execution_context_id,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+        )
+        capsule = compile_ac_execution_capsule(
+            runtime_identity=runtime_identity,
+            execution_id=execution_context_id,
+            semantic_ac_key=semantic_ac_key,
+            workspace=(
+                self._task_cwd or getattr(self._adapter, "working_directory", None) or os.getcwd()
+            ),
+            authority_scope=(
+                build_ac_dispatch_authority_scope(
+                    base_scope=self.execution_authority.fingerprint,
+                    dispatch_contract={
+                        "backend": getattr(self._adapter, "runtime_backend", None),
+                        "tools": list(tools),
+                        # The allow-list is only a projection of the provider
+                        # contract.  Fingerprint the complete canonical catalog
+                        # too, so schema/source changes cannot reuse a dispatch
+                        # authority that merely has the same tool names.
+                        # Preserve presence separately from entries: ``None``
+                        # means the provider received no catalog authority,
+                        # while an explicit empty tuple means an intentionally
+                        # empty capability/control-plane contract.
+                        "tool_catalog": {
+                            "present": tool_catalog is not None,
+                            "entries": serialize_tool_catalog(tool_catalog or ()),
+                        },
+                        "system_prompt": system_prompt,
+                        "ac_content": ac_content,
+                        "seed_goal": seed_goal,
+                        "retry_prompt_extra": retry_prompt_extra,
+                        # These values are projected into the provider prompt
+                        # and therefore are part of the dispatch authority even
+                        # though they are not provider/session continuity.
+                        "sibling_acs": [
+                            {"ac_index": sibling_index, "content": sibling_content}
+                            for sibling_index, sibling_content in (sibling_acs or [])
+                        ],
+                        "level_context_prompt": build_context_prompt(level_contexts or []),
+                    },
+                    execution_policy={
+                        "retry_attempt": retry_attempt,
+                        "is_sub_ac": is_sub_ac,
+                        "decomposition_trustworthy": decomposition_trustworthy,
+                        "base_reasoning_effort": self._reasoning_effort,
+                        "model_routing": serialize_model_router(self._model_router),
+                        "execution_profile": (
+                            self._execution_profile.model_dump(mode="json")
+                            if self._execution_profile is not None
+                            else None
+                        ),
+                        "fat_harness_mode": self._fat_harness_mode,
+                        # Investment metadata is authority-bearing: the effort
+                        # router can lower or raise the dispatched tier from it.
+                        # Keep the canonical Seed representation in the capsule
+                        # scope so materially different investment decisions can
+                        # never reuse one durable dispatch identity.
+                        "investment_spec": (
+                            investment_spec.model_dump(mode="json")
+                            if investment_spec is not None
+                            else None
+                        ),
+                    },
+                )
+            ),
+            seed_goal=seed_goal,
+            ac_content=ac_content,
+            ac_spec=ac_spec,
+            level_contexts=tuple(level_contexts or ()),
+        )
 
         # Build prompt (label/indent, governed task section, success contract,
         # retry/parallel-awareness sections, cwd scan, completion contract).
@@ -5878,6 +5970,7 @@ Respond with either ATOMIC or the structured JSON object only.
             retry_attempt=retry_attempt,
             retry_prompt_extra=retry_prompt_extra,
             ac_spec=ac_spec,
+            capsule=capsule,
         )
         prompt = prompt_bundle.prompt
         label = prompt_bundle.label
@@ -5888,7 +5981,6 @@ Respond with either ATOMIC or the structured JSON object only.
         final_message = ""
         success = False
         clear_cached_runtime_handle = False
-        execution_context_id = execution_id or session_id
         persisted_runtime_handle = await self._load_persisted_ac_runtime_handle(
             ac_index,
             execution_context_id=execution_context_id,
@@ -5897,6 +5989,8 @@ Respond with either ATOMIC or the structured JSON object only.
             sub_ac_index=sub_ac_index,
             node_identity=node_identity,
             retry_attempt=retry_attempt,
+            expected_capsule_fingerprint=capsule.fingerprint,
+            expected_process_local_resume_nonce=self._process_local_resume_nonce,
         )
         if persisted_runtime_handle is not None:
             self._remember_ac_runtime_handle(
@@ -5919,14 +6013,27 @@ Respond with either ATOMIC or the structured JSON object only.
             retry_attempt=retry_attempt,
             tool_catalog=tool_catalog,
         )
-        runtime_identity = build_ac_runtime_identity(
-            ac_index,
-            execution_context_id=execution_context_id,
-            is_sub_ac=is_sub_ac,
-            parent_ac_index=parent_ac_index,
-            sub_ac_index=sub_ac_index,
-            node_identity=node_identity,
-            retry_attempt=retry_attempt,
+        runtime_handle = bind_capsule_to_runtime_handle(
+            capsule,
+            runtime_handle,
+            restored_same_attempt=(
+                persisted_runtime_handle is not None
+                or self._is_resumable_runtime_handle(runtime_handle)
+            ),
+            expected_backend=getattr(self._adapter, "runtime_backend", None),
+            expected_approval_mode=getattr(self._adapter, "permission_mode", None),
+        )
+        session_origin = (
+            "restored_same_attempt"
+            if persisted_runtime_handle is not None
+            or self._is_resumable_runtime_handle(runtime_handle)
+            else "fresh"
+        )
+        await self._event_emitter.emit_ac_capsule_compiled(
+            runtime_identity=runtime_identity,
+            session_id=session_id,
+            capsule=capsule,
+            session_origin=session_origin,
         )
         await self._emit_atomic_context_governed_event(
             runtime_identity=runtime_identity,
@@ -6117,7 +6224,65 @@ Respond with either ATOMIC or the structured JSON object only.
                 with contextlib.suppress(Exception):
                     shadow_snapshot_stack.close()
                 shadow_snapshot_stack = contextlib.ExitStack()
+        dispatch_id = uuid4().hex
+        previous_dispatch_id = None
+        if runtime_handle is not None:
+            previous_value = runtime_handle.metadata.get("ac_dispatch_id")
+            if isinstance(previous_value, str) and previous_value:
+                previous_dispatch_id = previous_value
+            runtime_metadata = dict(runtime_handle.metadata)
+            runtime_metadata["ac_dispatch_id"] = dispatch_id
+            runtime_metadata["ac_capsule_fingerprint"] = capsule.fingerprint
+            runtime_metadata["ac_session_origin"] = session_origin
+            runtime_handle = replace(runtime_handle, metadata=runtime_metadata)
+        await self._event_emitter.emit_ac_attempt_dispatched(
+            runtime_identity=runtime_identity,
+            dispatch_id=dispatch_id,
+            previous_dispatch_id=previous_dispatch_id,
+            execution_id=execution_context_id,
+            session_id=session_id,
+            capsule_fingerprint=capsule.fingerprint,
+            session_origin=session_origin,
+            runtime_handle=runtime_handle,
+        )
+        if runtime_handle is not None:
+            # Cache only after the dispatch transition is durable.  This still
+            # occurs before provider entry, so a runtime that returns a fresh
+            # handle can inherit the capsule bindings, while an append failure
+            # cannot leave an undurable dispatch ID as the next predecessor.
+            runtime_handle = self._remember_ac_runtime_handle(
+                ac_index,
+                runtime_handle,
+                execution_context_id=execution_context_id,
+                is_sub_ac=is_sub_ac,
+                parent_ac_index=parent_ac_index,
+                sub_ac_index=sub_ac_index,
+                node_identity=node_identity,
+                retry_attempt=retry_attempt,
+            )
         dispatch_state = LeafDispatchState(messages=messages, runtime_handle=runtime_handle)
+        active_dispatch_id = dispatch_id
+        sealed_dispatch_ids: set[str] = set()
+
+        async def _seal_dispatch(dispatch_id_to_seal: str, *, reason: str) -> None:
+            """Seal one provider boundary at most once."""
+            if dispatch_id_to_seal in sealed_dispatch_ids:
+                return
+            # Poison the local recovery cache before the durable append.  If
+            # the event store rejects the seal, a same-executor retry must not
+            # treat the already-entered provider boundary as replayable merely
+            # because the in-memory handle is still present.
+            self._ac_runtime_handle_manager.mark_dispatch_non_replayable(dispatch_id_to_seal)
+            await self._event_emitter.emit_ac_dispatch_sealed(
+                runtime_identity=runtime_identity,
+                dispatch_id=dispatch_id_to_seal,
+                execution_id=execution_context_id,
+                session_id=session_id,
+                capsule_fingerprint=capsule.fingerprint,
+                reason=reason,
+            )
+            sealed_dispatch_ids.add(dispatch_id_to_seal)
+
         signal_target: SessionSignalTarget | None = None
         signal_target_registered = False
         try:
@@ -6181,6 +6346,10 @@ Respond with either ATOMIC or the structured JSON object only.
                     message_count=dispatch_state.message_count,
                 )
                 clear_cached_runtime_handle = True
+                await _seal_dispatch(
+                    active_dispatch_id,
+                    reason="provider stall crossed an uncertain external-effect boundary",
+                )
                 return ACExecutionResult(
                     ac_index=ac_index,
                     ac_content=ac_content,
@@ -6233,6 +6402,94 @@ Respond with either ATOMIC or the structured JSON object only.
                         )
                         continue
 
+                    follow_up_prompt = (
+                        render_inform_signal_prompt(queued_signal.signal)
+                        if queued_signal.effective_mode is SessionSignalMode.INFORM
+                        else render_after_turn_signal_prompt(queued_signal.signal)
+                    )
+                    follow_up_runtime_handle = dispatch_state.runtime_handle
+                    if (
+                        follow_up_runtime_handle is None
+                        or not self._is_resumable_runtime_handle(follow_up_runtime_handle)
+                        or follow_up_runtime_handle.metadata.get("ac_capsule_fingerprint")
+                        != capsule.fingerprint
+                        or follow_up_runtime_handle.metadata.get("ac_dispatch_id")
+                        != active_dispatch_id
+                    ):
+                        await _seal_dispatch(
+                            active_dispatch_id,
+                            reason=(
+                                "completed provider turn cannot accept a SessionSignal "
+                                "without a capsule-bound resumable runtime handle"
+                            ),
+                        )
+                        await self._event_store.append(
+                            create_session_signal_rejected_event(
+                                queued_signal.signal,
+                                rejection_code="resumable_runtime_handle_unavailable",
+                                detail=(
+                                    "The active provider did not expose a capsule-bound "
+                                    "resumable runtime handle for this follow-up."
+                                ),
+                                effective_mode=queued_signal.effective_mode,
+                                runtime_backend=signal_target.runtime_backend,
+                                orchestrator_session_id=session_id,
+                            )
+                        )
+                        continue
+
+                    await _seal_dispatch(
+                        active_dispatch_id,
+                        reason="completed provider turn superseded by a SessionSignal follow-up",
+                    )
+                    follow_up_dispatch_id = uuid4().hex
+                    follow_up_metadata = dict(follow_up_runtime_handle.metadata)
+                    follow_up_metadata["ac_dispatch_id"] = follow_up_dispatch_id
+                    candidate_follow_up_runtime_handle = replace(
+                        follow_up_runtime_handle,
+                        metadata=follow_up_metadata,
+                    )
+                    await self._event_emitter.emit_ac_attempt_dispatched(
+                        runtime_identity=runtime_identity,
+                        dispatch_id=follow_up_dispatch_id,
+                        previous_dispatch_id=active_dispatch_id,
+                        execution_id=execution_context_id,
+                        session_id=session_id,
+                        capsule_fingerprint=capsule.fingerprint,
+                        session_origin="restored_same_attempt",
+                        runtime_handle=candidate_follow_up_runtime_handle,
+                        dispatch_kind="session_signal_followup",
+                        signal_id=queued_signal.signal.signal_id,
+                        signal_mode=queued_signal.effective_mode.value,
+                        follow_up_input_digest=(
+                            "sha256:" + hashlib.sha256(follow_up_prompt.encode("utf-8")).hexdigest()
+                        ),
+                    )
+                    # Do not expose the candidate handle to the outer failure
+                    # path until its dispatch append is durable.  If the
+                    # append fails, terminalization must retain the last
+                    # durable predecessor (the sealed primary), never the
+                    # nonexistent follow-up ID.
+                    active_dispatch_id = follow_up_dispatch_id
+                    # Keep the same durable-before-cache invariant as the
+                    # primary dispatch.  The follow-up handle is still cached
+                    # before provider entry, but a failed append cannot leave
+                    # its undurable dispatch ID as a phantom predecessor.
+                    remembered_follow_up_runtime_handle = self._remember_ac_runtime_handle(
+                        ac_index,
+                        candidate_follow_up_runtime_handle,
+                        execution_context_id=execution_context_id,
+                        is_sub_ac=is_sub_ac,
+                        parent_ac_index=parent_ac_index,
+                        sub_ac_index=sub_ac_index,
+                        node_identity=node_identity,
+                        retry_attempt=retry_attempt,
+                    )
+                    if remembered_follow_up_runtime_handle is None:
+                        raise RuntimeError(
+                            "SessionSignal follow-up lost its capsule-bound runtime handle"
+                        )
+                    dispatch_state.runtime_handle = remembered_follow_up_runtime_handle
                     message_count_before_signal = dispatch_state.message_count
                     primary_final_message = dispatch_state.final_message
                     primary_success = dispatch_state.success
@@ -6250,11 +6507,7 @@ Respond with either ATOMIC or the structured JSON object only.
                         await self._authority_leaf_dispatcher_stream(
                             self._authority_leaf_dispatcher,
                             state=dispatch_state,
-                            prompt=(
-                                render_inform_signal_prompt(queued_signal.signal)
-                                if inform_mode
-                                else render_after_turn_signal_prompt(queued_signal.signal)
-                            ),
+                            prompt=(follow_up_prompt),
                             tools=[] if inform_mode else tools,
                             system_prompt=system_prompt,
                             execute_effort_kwargs=execute_effort_kwargs,
@@ -6286,6 +6539,10 @@ Respond with either ATOMIC or the structured JSON object only.
                                 orchestrator_session_id=session_id,
                             )
                         )
+                        await _seal_dispatch(
+                            follow_up_dispatch_id,
+                            reason="SessionSignal follow-up crossed an uncertain delivery boundary",
+                        )
                         if inform_mode:
                             dispatch_state.success = primary_success
                             dispatch_state.final_message = primary_final_message
@@ -6315,6 +6572,10 @@ Respond with either ATOMIC or the structured JSON object only.
                                 runtime_backend=signal_target.runtime_backend,
                                 orchestrator_session_id=session_id,
                             )
+                        )
+                        await _seal_dispatch(
+                            follow_up_dispatch_id,
+                            reason="SessionSignal follow-up acknowledgement was uncertain",
                         )
                         if inform_mode:
                             dispatch_state.success = primary_success
@@ -6606,8 +6867,42 @@ Respond with either ATOMIC or the structured JSON object only.
                 error=fat_harness_error,
             )
 
+        except anyio.get_cancelled_exc_class():
+            # Cancellation after the durable dispatch event is an uncertain
+            # provider-effect boundary.  Shield the seal write so cancellation
+            # cannot leave a replayable handle that may resend work.
+            try:
+                with anyio.CancelScope(shield=True):
+                    await _seal_dispatch(
+                        active_dispatch_id,
+                        reason="provider attempt cancelled after dispatch boundary",
+                    )
+            except Exception as seal_error:
+                # A cancellation seal is the last durable protection against
+                # replay.  Hiding its failure would leave an entered provider
+                # boundary looking resumable, so surface a fail-closed error.
+                raise RuntimeError(
+                    "AC dispatch cancellation seal failed; refusing replayable recovery"
+                ) from seal_error
+            self._remember_ac_runtime_handle(
+                ac_index,
+                dispatch_state.runtime_handle,
+                execution_context_id=execution_context_id,
+                is_sub_ac=is_sub_ac,
+                parent_ac_index=parent_ac_index,
+                sub_ac_index=sub_ac_index,
+                node_identity=node_identity,
+                retry_attempt=retry_attempt,
+            )
+            raise
+
         except Exception as e:
             duration = (datetime.now(UTC) - start_time).total_seconds()
+
+            await _seal_dispatch(
+                active_dispatch_id,
+                reason="provider attempt raised before authoritative terminalization",
+            )
 
             self._remember_ac_runtime_handle(
                 ac_index,
